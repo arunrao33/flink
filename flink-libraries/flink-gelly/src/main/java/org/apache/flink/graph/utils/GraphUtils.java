@@ -18,44 +18,24 @@
 
 package org.apache.flink.graph.utils;
 
-import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.DataSet;
-import org.apache.flink.api.java.Utils;
-import org.apache.flink.graph.Edge;
-import org.apache.flink.graph.Graph;
-import org.apache.flink.graph.Vertex;
+import org.apache.flink.api.java.functions.FunctionAnnotation.ForwardedFields;
+import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
+import org.apache.flink.api.java.typeutils.TypeExtractor;
+import org.apache.flink.graph.asm.translate.TranslateFunction;
 import org.apache.flink.types.LongValue;
-import org.apache.flink.util.AbstractID;
 
 import static org.apache.flink.api.java.typeutils.ValueTypeInfo.LONG_VALUE_TYPE_INFO;
 
+/**
+ * {@link Graph} utilities.
+ */
 public class GraphUtils {
 
-	/**
-	 * Convenience method to get the count (number of elements) of a Graph
-	 * as well as the checksum (sum over element hashes). The vertex and
-	 * edge DataSets are processed in a single job and the resultant counts
-	 * and checksums are merged locally.
-	 *
-	 * @param graph Graph over which to compute the count and checksum
-	 * @return the checksum over the vertices and edges
-	 */
-	public static <K, VV, EV> Utils.ChecksumHashCode checksumHashCode(Graph<K, VV, EV> graph) throws Exception {
-		final String verticesId = new AbstractID().toString();
-		graph.getVertices().output(new Utils.ChecksumHashCodeHelper<Vertex<K, VV>>(verticesId)).name("ChecksumHashCode vertices");
-
-		final String edgesId = new AbstractID().toString();
-		graph.getEdges().output(new Utils.ChecksumHashCodeHelper<Edge<K, EV>>(edgesId)).name("ChecksumHashCode edges");
-
-		JobExecutionResult res = graph.getContext().execute();
-
-		Utils.ChecksumHashCode checksum = res.<Utils.ChecksumHashCode>getAccumulatorResult(verticesId);
-		checksum.add(res.<Utils.ChecksumHashCode>getAccumulatorResult(edgesId));
-
-		return checksum;
-	}
+	private GraphUtils() {}
 
 	/**
 	 * Count the number of elements in a DataSet.
@@ -66,9 +46,38 @@ public class GraphUtils {
 	 */
 	public static <T> DataSet<LongValue> count(DataSet<T> input) {
 		return input
-			.map(new MapTo<T, LongValue>(new LongValue(1)))
+			.map(new MapTo<>(new LongValue(1)))
 				.returns(LONG_VALUE_TYPE_INFO)
-			.reduce(new AddLongValue());
+				.name("Emit 1")
+			.reduce(new AddLongValue())
+				.name("Sum");
+	}
+
+	/**
+	 * The identity mapper returns the input as output.
+	 *
+	 * @param <T> element type
+	 */
+	@ForwardedFields("*")
+	public static final class IdentityMapper<T>
+	implements MapFunction<T, T> {
+		public T map(T value) {
+			return value;
+		}
+	}
+
+	/**
+	 * The identity mapper returns the input as output.
+	 *
+	 * <p>This does not forward fields and is used to break an operator chain.
+	 *
+	 * @param <T> element type
+	 */
+	public static final class NonForwardingIdentityMapper<T>
+	implements MapFunction<T, T> {
+		public T map(T value) {
+			return value;
+		}
 	}
 
 	/**
@@ -78,7 +87,7 @@ public class GraphUtils {
 	 * @param <O> output type
 	 */
 	public static class MapTo<I, O>
-	implements MapFunction<I, O> {
+	implements MapFunction<I, O>, ResultTypeQueryable<O>, TranslateFunction<I, O> {
 		private final O value;
 
 		/**
@@ -91,8 +100,19 @@ public class GraphUtils {
 		}
 
 		@Override
-		public O map(I o) throws Exception {
+		public O map(I input) throws Exception {
 			return value;
+		}
+
+		@Override
+		public O translate(I input, O reuse)
+				throws Exception {
+			return value;
+		}
+
+		@Override
+		public TypeInformation<O> getProducedType() {
+			return (TypeInformation<O>) TypeExtractor.createTypeInfo(value.getClass());
 		}
 	}
 

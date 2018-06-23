@@ -19,11 +19,12 @@
 package org.apache.flink.metrics.statsd;
 
 import org.apache.flink.annotation.PublicEvolving;
-import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.Gauge;
 import org.apache.flink.metrics.Histogram;
 import org.apache.flink.metrics.HistogramStatistics;
+import org.apache.flink.metrics.Meter;
+import org.apache.flink.metrics.MetricConfig;
 import org.apache.flink.metrics.reporter.AbstractReporter;
 import org.apache.flink.metrics.reporter.Scheduled;
 
@@ -35,25 +36,25 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
+import java.nio.charset.StandardCharsets;
 import java.util.ConcurrentModificationException;
 import java.util.Map;
 import java.util.NoSuchElementException;
 
 /**
- * Largely based on the StatsDReporter class by ReadyTalk
- * https://github.com/ReadyTalk/metrics-statsd/blob/master/metrics3-statsd/src/main/java/com/readytalk/metrics/StatsDReporter.java
+ * Largely based on the StatsDReporter class by ReadyTalk.
  *
- * Ported since it was not present in maven central.
+ * <p>https://github.com/ReadyTalk/metrics-statsd/blob/master/metrics3-statsd/src/main/java/com/readytalk/metrics/StatsDReporter.java
+ *
+ * <p>Ported since it was not present in maven central.
  */
 @PublicEvolving
 public class StatsDReporter extends AbstractReporter implements Scheduled {
-	
+
 	private static final Logger LOG = LoggerFactory.getLogger(StatsDReporter.class);
 
 	public static final String ARG_HOST = "host";
 	public static final String ARG_PORT = "port";
-//	public static final String ARG_CONVERSION_RATE = "rateConversion";
-//	public static final String ARG_CONVERSION_DURATION = "durationConversion";
 
 	private boolean closed = false;
 
@@ -61,7 +62,7 @@ public class StatsDReporter extends AbstractReporter implements Scheduled {
 	private InetSocketAddress address;
 
 	@Override
-	public void open(Configuration config) {
+	public void open(MetricConfig config) {
 		String host = config.getString(ARG_HOST, null);
 		int port = config.getInteger(ARG_PORT, -1);
 
@@ -71,16 +72,12 @@ public class StatsDReporter extends AbstractReporter implements Scheduled {
 
 		this.address = new InetSocketAddress(host, port);
 
-//		String conversionRate = config.getString(ARG_CONVERSION_RATE, "SECONDS");
-//		String conversionDuration = config.getString(ARG_CONVERSION_DURATION, "MILLISECONDS");
-//		this.rateFactor = TimeUnit.valueOf(conversionRate).toSeconds(1);
-//		this.durationFactor = 1.0 / TimeUnit.valueOf(conversionDuration).toNanos(1);
-
 		try {
 			this.socket = new DatagramSocket(0);
 		} catch (SocketException e) {
 			throw new RuntimeException("Could not create datagram socket. ", e);
 		}
+		log.info("Configured StatsDReporter with {host:{}, port:{}}", host, port);
 	}
 
 	@Override
@@ -116,6 +113,10 @@ public class StatsDReporter extends AbstractReporter implements Scheduled {
 			for (Map.Entry<Histogram, String> entry : histograms.entrySet()) {
 				reportHistogram(entry.getValue(), entry.getKey());
 			}
+
+			for (Map.Entry<Meter, String> entry : meters.entrySet()) {
+				reportMeter(entry.getValue(), entry.getKey());
+			}
 		}
 		catch (ConcurrentModificationException | NoSuchElementException e) {
 			// ignore - may happen when metrics are concurrently added or removed
@@ -124,7 +125,7 @@ public class StatsDReporter extends AbstractReporter implements Scheduled {
 	}
 
 	// ------------------------------------------------------------------------
-	
+
 	private void reportCounter(final String name, final Counter counter) {
 		send(name, String.valueOf(counter.getCount()));
 	}
@@ -157,6 +158,13 @@ public class StatsDReporter extends AbstractReporter implements Scheduled {
 		}
 	}
 
+	private void reportMeter(final String name, final Meter meter) {
+		if (meter != null) {
+			send(prefix(name, "rate"), String.valueOf(meter.getRate()));
+			send(prefix(name, "count"), String.valueOf(meter.getCount()));
+		}
+	}
+
 	private String prefix(String ... names) {
 		if (names.length > 0) {
 			StringBuilder stringBuilder = new StringBuilder(names[0]);
@@ -174,11 +182,38 @@ public class StatsDReporter extends AbstractReporter implements Scheduled {
 	private void send(final String name, final String value) {
 		try {
 			String formatted = String.format("%s:%s|g", name, value);
-			byte[] data = formatted.getBytes();
+			byte[] data = formatted.getBytes(StandardCharsets.UTF_8);
 			socket.send(new DatagramPacket(data, data.length, this.address));
 		}
 		catch (IOException e) {
 			LOG.error("unable to send packet to statsd at '{}:{}'", address.getHostName(), address.getPort());
 		}
+	}
+
+	@Override
+	public String filterCharacters(String input) {
+		char[] chars = null;
+		final int strLen = input.length();
+		int pos = 0;
+
+		for (int i = 0; i < strLen; i++) {
+			final char c = input.charAt(i);
+			switch (c) {
+				case ':':
+					if (chars == null) {
+						chars = input.toCharArray();
+					}
+					chars[pos++] = '-';
+					break;
+
+				default:
+					if (chars != null) {
+						chars[pos] = c;
+					}
+					pos++;
+			}
+		}
+
+		return chars == null ? input : new String(chars, 0, pos);
 	}
 }

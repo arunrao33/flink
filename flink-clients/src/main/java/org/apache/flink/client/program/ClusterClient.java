@@ -18,22 +18,14 @@
 
 package org.apache.flink.client.program;
 
-import java.io.IOException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.URISyntaxException;
-import java.net.URL;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-
-import akka.actor.ActorRef;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobSubmissionResult;
 import org.apache.flink.api.common.Plan;
 import org.apache.flink.api.common.accumulators.AccumulatorHelper;
-import org.apache.flink.configuration.ConfigConstants;
+import org.apache.flink.api.common.time.Time;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.optimizer.CompilerException;
 import org.apache.flink.optimizer.DataStatistics;
 import org.apache.flink.optimizer.Optimizer;
@@ -43,68 +35,109 @@ import org.apache.flink.optimizer.plan.OptimizedPlan;
 import org.apache.flink.optimizer.plan.StreamingPlan;
 import org.apache.flink.optimizer.plandump.PlanJSONDumpGenerator;
 import org.apache.flink.optimizer.plantranslate.JobGraphGenerator;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.core.fs.Path;
+import org.apache.flink.runtime.akka.AkkaJobManagerGateway;
 import org.apache.flink.runtime.akka.AkkaUtils;
 import org.apache.flink.runtime.client.JobClient;
 import org.apache.flink.runtime.client.JobExecutionException;
+import org.apache.flink.runtime.client.JobListeningContext;
+import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.clusterframework.BootstrapTools;
 import org.apache.flink.runtime.clusterframework.messages.GetClusterStatusResponse;
+import org.apache.flink.runtime.concurrent.Executors;
+import org.apache.flink.runtime.concurrent.FutureUtils;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServices;
+import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils;
 import org.apache.flink.runtime.instance.ActorGateway;
 import org.apache.flink.runtime.jobgraph.JobGraph;
+import org.apache.flink.runtime.jobgraph.JobStatus;
+import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
+import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalException;
 import org.apache.flink.runtime.leaderretrieval.LeaderRetrievalService;
+import org.apache.flink.runtime.messages.Acknowledge;
+import org.apache.flink.runtime.messages.JobManagerMessages;
 import org.apache.flink.runtime.messages.accumulators.AccumulatorResultsErroneous;
 import org.apache.flink.runtime.messages.accumulators.AccumulatorResultsFound;
 import org.apache.flink.runtime.messages.accumulators.RequestAccumulatorResults;
-import org.apache.flink.runtime.messages.JobManagerMessages;
-import org.apache.flink.runtime.net.ConnectionUtils;
+import org.apache.flink.runtime.messages.webmonitor.JobDetails;
+import org.apache.flink.runtime.messages.webmonitor.MultipleJobsDetails;
+import org.apache.flink.runtime.messages.webmonitor.RequestJobDetails;
+import org.apache.flink.runtime.util.LeaderConnectionInfo;
 import org.apache.flink.runtime.util.LeaderRetrievalUtils;
+import org.apache.flink.util.FlinkException;
+import org.apache.flink.util.FlinkRuntimeException;
+import org.apache.flink.util.OptionalFailure;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.SerializedValue;
+
+import akka.actor.ActorSystem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import scala.Some;
-import scala.Tuple2;
+import javax.annotation.Nullable;
+
+import java.net.InetAddress;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+
+import scala.Option;
 import scala.concurrent.Await;
 import scala.concurrent.Future;
 import scala.concurrent.duration.FiniteDuration;
-import akka.actor.ActorSystem;
-
 
 /**
  * Encapsulates the functionality necessary to submit a program to a remote cluster.
+ *
+ * @param <T> type of the cluster id
  */
-public abstract class ClusterClient {
+public abstract class ClusterClient<T> {
 
-	private final Logger LOG = LoggerFactory.getLogger(getClass());
+	protected final Logger log = LoggerFactory.getLogger(getClass());
 
-	/** The optimizer used in the optimization of batch programs */
+	/** The optimizer used in the optimization of batch programs. */
 	final Optimizer compiler;
 
-	/** The actor system used to communicate with the JobManager */
-	protected final ActorSystem actorSystem;
+	/** The actor system used to communicate with the JobManager. */
+	protected final ActorSystemLoader actorSystemLoader;
 
-	/** Configuration of the client */
+	/** Configuration of the client. */
 	protected final Configuration flinkConfig;
 
-	/** Timeout for futures */
+	/** Timeout for futures. */
 	protected final FiniteDuration timeout;
 
-	/** Lookup timeout for the job manager retrieval service */
+	/** Lookup timeout for the job manager retrieval service. */
 	private final FiniteDuration lookupTimeout;
 
-	/** Flag indicating whether to sysout print execution updates */
+	/** Service factory for high available. */
+	protected final HighAvailabilityServices highAvailabilityServices;
+
+	private final boolean sharedHaServices;
+
+	/** Flag indicating whether to sysout print execution updates. */
 	private boolean printStatusDuringExecution = true;
 
 	/**
-	 * For interactive invocations, the Job ID is only available after the ContextEnvironment has
+	 * For interactive invocations, the job results are only available after the ContextEnvironment has
 	 * been run inside the user JAR. We pass the Client to every instance of the ContextEnvironment
-	 * which lets us access the last JobID here.
+	 * which lets us access the execution result here.
 	 */
-	private JobID lastJobID;
+	protected JobExecutionResult lastJobExecutionResult;
 
-	/** Switch for blocking/detached job submission of the client */
+	/** Switch for blocking/detached job submission of the client. */
 	private boolean detachedJobSubmission = false;
+
+	/**
+	 * Value returned by {@link #getMaxSlots()} if the number of maximum slots is unknown.
+	 */
+	public static final int MAX_SLOTS_UNKNOWN = -1;
 
 	// ------------------------------------------------------------------------
 	//                            Construction
@@ -117,17 +150,62 @@ public abstract class ClusterClient {
 	 *
 	 * @param flinkConfig The config used to obtain the job-manager's address, and used to configure the optimizer.
 	 *
-	 * @throws java.io.IOException Thrown, if the client's actor system could not be started.
+	 * @throws Exception we cannot create the high availability services
 	 */
-	public ClusterClient(Configuration flinkConfig) throws IOException {
+	public ClusterClient(Configuration flinkConfig) throws Exception {
+		this(
+			flinkConfig,
+			HighAvailabilityServicesUtils.createHighAvailabilityServices(
+				flinkConfig,
+				Executors.directExecutor(),
+				HighAvailabilityServicesUtils.AddressResolution.TRY_ADDRESS_RESOLUTION),
+			false);
+	}
 
+	/**
+	 * Creates a instance that submits the programs to the JobManager defined in the
+	 * configuration. This method will try to resolve the JobManager hostname and throw an exception
+	 * if that is not possible.
+	 *
+	 * @param flinkConfig The config used to obtain the job-manager's address, and used to configure the optimizer.
+	 * @param highAvailabilityServices HighAvailabilityServices to use for leader retrieval
+	 * @param sharedHaServices true if the HighAvailabilityServices are shared and must not be shut down
+	 */
+	public ClusterClient(
+			Configuration flinkConfig,
+			HighAvailabilityServices highAvailabilityServices,
+			boolean sharedHaServices) {
 		this.flinkConfig = Preconditions.checkNotNull(flinkConfig);
 		this.compiler = new Optimizer(new DataStatistics(), new DefaultCostEstimator(), flinkConfig);
 
 		this.timeout = AkkaUtils.getClientTimeout(flinkConfig);
 		this.lookupTimeout = AkkaUtils.getLookupTimeout(flinkConfig);
 
-		this.actorSystem = createActorSystem();
+		this.actorSystemLoader = new LazyActorSystemLoader(
+			highAvailabilityServices,
+			Time.milliseconds(lookupTimeout.toMillis()),
+			flinkConfig,
+			log);
+
+		this.highAvailabilityServices = Preconditions.checkNotNull(highAvailabilityServices);
+		this.sharedHaServices = sharedHaServices;
+	}
+
+	public ClusterClient(
+			Configuration flinkConfig,
+			HighAvailabilityServices highAvailabilityServices,
+			boolean sharedHaServices,
+			ActorSystemLoader actorSystemLoader) {
+		this.flinkConfig = Preconditions.checkNotNull(flinkConfig);
+		this.compiler = new Optimizer(new DataStatistics(), new DefaultCostEstimator(), flinkConfig);
+
+		this.timeout = AkkaUtils.getClientTimeout(flinkConfig);
+		this.lookupTimeout = AkkaUtils.getLookupTimeout(flinkConfig);
+
+		this.actorSystemLoader = Preconditions.checkNotNull(actorSystemLoader);
+
+		this.highAvailabilityServices = Preconditions.checkNotNull(highAvailabilityServices);
+		this.sharedHaServices = sharedHaServices;
 	}
 
 	// ------------------------------------------------------------------------
@@ -135,45 +213,95 @@ public abstract class ClusterClient {
 	// ------------------------------------------------------------------------
 
 	/**
-	 * Method to create the ActorSystem of the Client. May be overriden in subclasses.
-	 * @return ActorSystem
-	 * @throws IOException
+	 * Utility class to lazily instantiate an {@link ActorSystem}.
 	 */
-	protected ActorSystem createActorSystem() throws IOException {
+	protected static class LazyActorSystemLoader implements ActorSystemLoader {
 
-		if (actorSystem != null) {
-			throw new RuntimeException("This method may only be called once.");
+		private final Logger log;
+
+		private final HighAvailabilityServices highAvailabilityServices;
+
+		private final Time timeout;
+
+		private final Configuration configuration;
+
+		private ActorSystem actorSystem;
+
+		private LazyActorSystemLoader(
+				HighAvailabilityServices highAvailabilityServices,
+				Time timeout,
+				Configuration configuration,
+				Logger log) {
+			this.highAvailabilityServices = Preconditions.checkNotNull(highAvailabilityServices);
+			this.timeout = Preconditions.checkNotNull(timeout);
+			this.configuration = Preconditions.checkNotNull(configuration);
+			this.log = Preconditions.checkNotNull(log);
 		}
 
-		// start actor system
-		LOG.info("Starting client actor system.");
-
-		String hostName = flinkConfig.getString(ConfigConstants.JOB_MANAGER_IPC_ADDRESS_KEY, null);
-		int port = flinkConfig.getInteger(ConfigConstants.JOB_MANAGER_IPC_PORT_KEY, -1);
-		if (hostName == null || port == -1) {
-			throw new IOException("The initial JobManager address has not been set correctly.");
+		/**
+		 * Indicates whether the ActorSystem has already been instantiated.
+		 * @return boolean True if it exists, False otherwise
+		 */
+		public boolean isLoaded() {
+			return actorSystem != null;
 		}
-		InetSocketAddress initialJobManagerAddress = new InetSocketAddress(hostName, port);
 
-		// find name of own public interface, able to connect to the JM
-		// try to find address for 2 seconds. log after 400 ms.
-		InetAddress ownHostname = ConnectionUtils.findConnectingAddress(initialJobManagerAddress, 2000, 400);
-		return AkkaUtils.createActorSystem(flinkConfig,
-			new Some<>(new Tuple2<String, Object>(ownHostname.getCanonicalHostName(), 0)));
+		@Override
+		public void close() throws Exception {
+			if (isLoaded()) {
+				actorSystem.shutdown();
+				actorSystem.awaitTermination();
+				actorSystem = null;
+			}
+		}
+
+		/**
+		 * Creates a new ActorSystem or returns an existing one.
+		 * @return ActorSystem
+		 * @throws Exception if the ActorSystem could not be created
+		 */
+		@Override
+		public ActorSystem get() throws FlinkException {
+
+			if (!isLoaded()) {
+				// start actor system
+				log.info("Starting client actor system.");
+
+				final InetAddress ownHostname;
+				try {
+					ownHostname = LeaderRetrievalUtils.findConnectingAddress(
+						highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),
+						timeout);
+				} catch (LeaderRetrievalException lre) {
+					throw new FlinkException("Could not find out our own hostname by connecting to the " +
+						"leading JobManager. Please make sure that the Flink cluster has been started.", lre);
+				}
+
+				try {
+					actorSystem = BootstrapTools.startActorSystem(
+						configuration,
+						ownHostname.getCanonicalHostName(),
+						0,
+						log);
+				} catch (Exception e) {
+					throw new FlinkException("Could not start the ActorSystem lazily.", e);
+				}
+			}
+
+			return actorSystem;
+		}
+
 	}
 
 	/**
 	 * Shuts down the client. This stops the internal actor system and actors.
 	 */
-	public void shutdown() {
+	public void shutdown() throws Exception {
 		synchronized (this) {
-			try {
-				finalizeCluster();
-			} finally {
-				if (!this.actorSystem.isTerminated()) {
-					this.actorSystem.shutdown();
-					this.actorSystem.awaitTermination();
-				}
+			actorSystemLoader.close();
+
+			if (!sharedHaServices && highAvailabilityServices != null) {
+				highAvailabilityServices.close();
 			}
 		}
 	}
@@ -200,30 +328,15 @@ public abstract class ClusterClient {
 	}
 
 	/**
-	 * Gets the current JobManager address from the Flink configuration (may change in case of a HA setup).
-	 * @return The address (host and port) of the leading JobManager
+	 * Gets the current cluster connection info (may change in case of a HA setup).
+	 *
+	 * @return The the connection info to the leader component of the cluster
+	 * @throws LeaderRetrievalException if the leader could not be retrieved
 	 */
-	public InetSocketAddress getJobManagerAddressFromConfig() {
-		try {
-			String hostName = flinkConfig.getString(ConfigConstants.JOB_MANAGER_IPC_ADDRESS_KEY, null);
-			int port = flinkConfig.getInteger(ConfigConstants.JOB_MANAGER_IPC_PORT_KEY, -1);
-			return new InetSocketAddress(hostName, port);
-		} catch (Exception e) {
-			throw new RuntimeException("Failed to retrieve JobManager address", e);
-		}
-	}
-
-	/**
-	 * Gets the current JobManager address (may change in case of a HA setup).
-	 * @return The address (host and port) of the leading JobManager
-	 */
-	public InetSocketAddress getJobManagerAddress() {
-		try {
-			final ActorRef jmActor = getJobManagerGateway().actor();
-			return AkkaUtils.getInetSockeAddressFromAkkaURL(jmActor.path().toSerializationFormat());
-		} catch (Exception e) {
-			throw new RuntimeException("Failed to retrieve JobManager address", e);
-		}
+	public LeaderConnectionInfo getClusterConnectionInfo() throws LeaderRetrievalException {
+		return LeaderRetrievalUtils.retrieveLeaderConnectionInfo(
+			highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),
+			timeout);
 	}
 
 	// ------------------------------------------------------------------------
@@ -231,15 +344,13 @@ public abstract class ClusterClient {
 	// ------------------------------------------------------------------------
 
 	public static String getOptimizedPlanAsJson(Optimizer compiler, PackagedProgram prog, int parallelism)
-			throws CompilerException, ProgramInvocationException
-	{
+			throws CompilerException, ProgramInvocationException {
 		PlanJSONDumpGenerator jsonGen = new PlanJSONDumpGenerator();
 		return jsonGen.getOptimizerPlanAsJSON((OptimizedPlan) getOptimizedPlan(compiler, prog, parallelism));
 	}
 
 	public static FlinkPlan getOptimizedPlan(Optimizer compiler, PackagedProgram prog, int parallelism)
-			throws CompilerException, ProgramInvocationException
-	{
+			throws CompilerException, ProgramInvocationException {
 		Thread.currentThread().setContextClassLoader(prog.getUserCodeClassLoader());
 		if (prog.isUsingProgramEntryPoint()) {
 			return getOptimizedPlan(compiler, prog.getPlanWithJars(), parallelism);
@@ -278,32 +389,51 @@ public abstract class ClusterClient {
 	 * @param prog the packaged program
 	 * @param parallelism the parallelism to execute the contained Flink job
 	 * @return The result of the execution
+	 * @throws ProgramMissingJobException
 	 * @throws ProgramInvocationException
 	 */
 	public JobSubmissionResult run(PackagedProgram prog, int parallelism)
-			throws ProgramInvocationException
-	{
+			throws ProgramInvocationException, ProgramMissingJobException {
 		Thread.currentThread().setContextClassLoader(prog.getUserCodeClassLoader());
 		if (prog.isUsingProgramEntryPoint()) {
-			return run(prog.getPlanWithJars(), parallelism, prog.getSavepointPath());
+
+			final JobWithJars jobWithJars;
+			if (hasUserJarsInClassPath(prog.getAllLibraries())) {
+				jobWithJars = prog.getPlanWithoutJars();
+			} else {
+				jobWithJars = prog.getPlanWithJars();
+			}
+
+			return run(jobWithJars, parallelism, prog.getSavepointSettings());
 		}
 		else if (prog.isUsingInteractiveMode()) {
-			LOG.info("Starting program in interactive mode");
-			ContextEnvironmentFactory factory = new ContextEnvironmentFactory(this, prog.getAllLibraries(),
+			log.info("Starting program in interactive mode (detached: {})", isDetached());
+
+			final List<URL> libraries;
+			if (hasUserJarsInClassPath(prog.getAllLibraries())) {
+				libraries = Collections.emptyList();
+			} else {
+				libraries = prog.getAllLibraries();
+			}
+
+			ContextEnvironmentFactory factory = new ContextEnvironmentFactory(this, libraries,
 					prog.getClasspaths(), prog.getUserCodeClassLoader(), parallelism, isDetached(),
-					prog.getSavepointPath());
+					prog.getSavepointSettings());
 			ContextEnvironment.setAsContext(factory);
 
 			try {
 				// invoke main method
 				prog.invokeInteractiveModeForExecution();
+				if (lastJobExecutionResult == null && factory.getLastEnvCreated() == null) {
+					throw new ProgramMissingJobException("The program didn't contain a Flink job.");
+				}
 				if (isDetached()) {
 					// in detached mode, we execute the whole user code to extract the Flink job, afterwards we run it here
 					return ((DetachedEnvironment) factory.getLastEnvCreated()).finalizeExecute();
 				}
 				else {
 					// in blocking mode, we execute all Flink jobs contained in the user code and then return here
-					return new JobSubmissionResult(lastJobID);
+					return this.lastJobExecutionResult;
 				}
 			}
 			finally {
@@ -311,19 +441,19 @@ public abstract class ClusterClient {
 			}
 		}
 		else {
-			throw new RuntimeException("PackagedProgram does not have a valid invocation mode.");
+			throw new ProgramInvocationException("PackagedProgram does not have a valid invocation mode.");
 		}
 	}
 
 	public JobSubmissionResult run(JobWithJars program, int parallelism) throws ProgramInvocationException {
-		return run(program, parallelism, null);
+		return run(program, parallelism, SavepointRestoreSettings.none());
 	}
 
 	/**
 	 * Runs a program on the Flink cluster to which this client is connected. The call blocks until the
 	 * execution is complete, and returns afterwards.
 	 *
-	 * @param program The program to be executed.
+	 * @param jobWithJars The program to be executed.
 	 * @param parallelism The default parallelism to use when running the program. The default parallelism is used
 	 *                    when the program does not set a parallelism by itself.
 	 *
@@ -333,27 +463,26 @@ public abstract class ClusterClient {
 	 *                                    i.e. the job-manager is unreachable, or due to the fact that the
 	 *                                    parallel execution failed.
 	 */
-	public JobSubmissionResult run(JobWithJars program, int parallelism, String savepointPath)
+	public JobSubmissionResult run(JobWithJars jobWithJars, int parallelism, SavepointRestoreSettings savepointSettings)
 			throws CompilerException, ProgramInvocationException {
-		ClassLoader classLoader = program.getUserCodeClassLoader();
+		ClassLoader classLoader = jobWithJars.getUserCodeClassLoader();
 		if (classLoader == null) {
 			throw new IllegalArgumentException("The given JobWithJars does not provide a usercode class loader.");
 		}
 
-		OptimizedPlan optPlan = getOptimizedPlan(compiler, program, parallelism);
-		return run(optPlan, program.getJarFiles(), program.getClasspaths(), classLoader, savepointPath);
+		OptimizedPlan optPlan = getOptimizedPlan(compiler, jobWithJars, parallelism);
+		return run(optPlan, jobWithJars.getJarFiles(), jobWithJars.getClasspaths(), classLoader, savepointSettings);
 	}
 
 	public JobSubmissionResult run(
 			FlinkPlan compiledPlan, List<URL> libraries, List<URL> classpaths, ClassLoader classLoader) throws ProgramInvocationException {
-		return run(compiledPlan, libraries, classpaths, classLoader, null);
+		return run(compiledPlan, libraries, classpaths, classLoader, SavepointRestoreSettings.none());
 	}
 
 	public JobSubmissionResult run(FlinkPlan compiledPlan,
-			List<URL> libraries, List<URL> classpaths, ClassLoader classLoader, String savepointPath)
-		throws ProgramInvocationException
-	{
-		JobGraph job = getJobGraph(compiledPlan, libraries, classpaths, savepointPath);
+			List<URL> libraries, List<URL> classpaths, ClassLoader classLoader, SavepointRestoreSettings savepointSettings)
+			throws ProgramInvocationException {
+		JobGraph job = getJobGraph(flinkConfig, compiledPlan, libraries, classpaths, savepointSettings);
 		return submitJob(job, classLoader);
 	}
 
@@ -365,19 +494,32 @@ public abstract class ClusterClient {
 	 * @throws ProgramInvocationException
 	 */
 	public JobExecutionResult run(JobGraph jobGraph, ClassLoader classLoader) throws ProgramInvocationException {
-		LeaderRetrievalService leaderRetrievalService;
+
+		waitForClusterToBeReady();
+
+		final ActorSystem actorSystem;
+
 		try {
-			leaderRetrievalService = LeaderRetrievalUtils.createLeaderRetrievalService(flinkConfig);
-		} catch (Exception e) {
-			throw new ProgramInvocationException("Could not create the leader retrieval service", e);
+			actorSystem = actorSystemLoader.get();
+		} catch (FlinkException fe) {
+			throw new ProgramInvocationException("Could not start the ActorSystem needed to talk to the " +
+				"JobManager.", jobGraph.getJobID(), fe);
 		}
 
 		try {
-			this.lastJobID = jobGraph.getJobID();
-			return JobClient.submitJobAndWait(actorSystem,
-				leaderRetrievalService, jobGraph, timeout, printStatusDuringExecution, classLoader);
+			logAndSysout("Submitting job with JobID: " + jobGraph.getJobID() + ". Waiting for job completion.");
+			this.lastJobExecutionResult = JobClient.submitJobAndWait(
+				actorSystem,
+				flinkConfig,
+				highAvailabilityServices,
+				jobGraph,
+				timeout,
+				printStatusDuringExecution,
+				classLoader);
+
+			return lastJobExecutionResult;
 		} catch (JobExecutionException e) {
-			throw new ProgramInvocationException("The program execution failed: " + e.getMessage(), e);
+			throw new ProgramInvocationException("The program execution failed: " + e.getMessage(), jobGraph.getJobID(), e);
 		}
 	}
 
@@ -389,20 +531,115 @@ public abstract class ClusterClient {
 	 * @throws ProgramInvocationException
 	 */
 	public JobSubmissionResult runDetached(JobGraph jobGraph, ClassLoader classLoader) throws ProgramInvocationException {
-		ActorGateway jobManagerGateway;
 
+		waitForClusterToBeReady();
+
+		final ActorGateway jobManagerGateway;
 		try {
 			jobManagerGateway = getJobManagerGateway();
 		} catch (Exception e) {
-			throw new ProgramInvocationException("Failed to retrieve the JobManager gateway.", e);
+			throw new ProgramInvocationException("Failed to retrieve the JobManager gateway.",
+				jobGraph.getJobID(), e);
 		}
 
 		try {
-			JobClient.submitJobDetached(jobManagerGateway, jobGraph, timeout, classLoader);
+			logAndSysout("Submitting Job with JobID: " + jobGraph.getJobID() + ". Returning after job submission.");
+			JobClient.submitJobDetached(
+				new AkkaJobManagerGateway(jobManagerGateway),
+				flinkConfig,
+				jobGraph,
+				Time.milliseconds(timeout.toMillis()),
+				classLoader);
 			return new JobSubmissionResult(jobGraph.getJobID());
 		} catch (JobExecutionException e) {
-			throw new ProgramInvocationException("The program execution failed: " + e.getMessage(), e);
+			throw new ProgramInvocationException("The program execution failed: " + e.getMessage(),
+				jobGraph.getJobID(), e);
 		}
+	}
+
+	/**
+	 * Reattaches to a running from the supplied job id.
+	 * @param jobID The job id of the job to attach to
+	 * @return The JobExecutionResult for the jobID
+	 * @throws JobExecutionException if an error occurs during monitoring the job execution
+	 */
+	public JobExecutionResult retrieveJob(JobID jobID) throws JobExecutionException {
+		final ActorSystem actorSystem;
+
+		try {
+			actorSystem = actorSystemLoader.get();
+		} catch (FlinkException fe) {
+			throw new JobExecutionException(
+				jobID,
+				"Could not start the ActorSystem needed to talk to the JobManager.",
+				fe);
+		}
+
+		final JobListeningContext listeningContext = JobClient.attachToRunningJob(
+			jobID,
+			flinkConfig,
+			actorSystem,
+			highAvailabilityServices,
+			timeout,
+			printStatusDuringExecution);
+
+		return JobClient.awaitJobResult(listeningContext);
+	}
+
+	/**
+	 * Reattaches to a running job with the given job id.
+	 *
+	 * @param jobID The job id of the job to attach to
+	 * @return The JobExecutionResult for the jobID
+	 * @throws JobExecutionException if an error occurs during monitoring the job execution
+	 */
+	public JobListeningContext connectToJob(JobID jobID) throws JobExecutionException {
+		final ActorSystem actorSystem;
+
+		try {
+			actorSystem = actorSystemLoader.get();
+		} catch (FlinkException fe) {
+			throw new JobExecutionException(
+				jobID,
+				"Could not start the ActorSystem needed to talk to the JobManager.",
+				fe);
+		}
+
+		return JobClient.attachToRunningJob(
+			jobID,
+			flinkConfig,
+			actorSystem,
+			highAvailabilityServices,
+			timeout,
+			printStatusDuringExecution);
+	}
+
+	/**
+	 * Requests the {@link JobStatus} of the job with the given {@link JobID}.
+	 */
+	public CompletableFuture<JobStatus> getJobStatus(JobID jobId) {
+		final ActorGateway jobManager;
+		try {
+			jobManager = getJobManagerGateway();
+		} catch (FlinkException e) {
+			throw new RuntimeException("Could not retrieve JobManage gateway.", e);
+		}
+
+		Future<Object> response = jobManager.ask(JobManagerMessages.getRequestJobStatus(jobId), timeout);
+
+		CompletableFuture<Object> javaFuture = FutureUtils.<Object>toJava(response);
+
+		return javaFuture.thenApply((responseMessage) -> {
+			if (responseMessage instanceof JobManagerMessages.CurrentJobStatus) {
+				return ((JobManagerMessages.CurrentJobStatus) responseMessage).status();
+			} else if (responseMessage instanceof JobManagerMessages.JobNotFound) {
+				throw new CompletionException(
+					new IllegalStateException("Could not find job with JobId " + jobId));
+			} else {
+				throw new CompletionException(
+					new IllegalStateException("Unknown JobManager response of type " + responseMessage.getClass()));
+			}
+		});
 	}
 
 	/**
@@ -411,25 +648,46 @@ public abstract class ClusterClient {
 	 * @throws Exception In case an error occurred.
 	 */
 	public void cancel(JobID jobId) throws Exception {
-		final ActorGateway jobManagerGateway = getJobManagerGateway();
+		final ActorGateway jobManager = getJobManagerGateway();
 
-		final Future<Object> response;
-		try {
-			response = jobManagerGateway.ask(new JobManagerMessages.CancelJob(jobId), timeout);
-		} catch (final Exception e) {
-			throw new ProgramInvocationException("Failed to query the job manager gateway.", e);
-		}
+		Object cancelMsg = new JobManagerMessages.CancelJob(jobId);
 
-		final Object result = Await.result(response, timeout);
+		Future<Object> response = jobManager.ask(cancelMsg, timeout);
+		final Object rc = Await.result(response, timeout);
 
-		if (result instanceof JobManagerMessages.CancellationSuccess) {
-			LOG.info("Job cancellation with ID " + jobId + " succeeded.");
-		} else if (result instanceof JobManagerMessages.CancellationFailure) {
-			final Throwable t = ((JobManagerMessages.CancellationFailure) result).cause();
-			LOG.info("Job cancellation with ID " + jobId + " failed.", t);
-			throw new Exception("Failed to cancel the job because of \n" + t.getMessage());
+		if (rc instanceof JobManagerMessages.CancellationSuccess) {
+			// no further action required
+		} else if (rc instanceof JobManagerMessages.CancellationFailure) {
+			throw new Exception("Canceling the job with ID " + jobId + " failed.",
+				((JobManagerMessages.CancellationFailure) rc).cause());
 		} else {
-			throw new Exception("Unknown message received while cancelling: " + result.getClass().getName());
+			throw new IllegalStateException("Unexpected response: " + rc);
+		}
+	}
+
+	/**
+	 * Cancels a job identified by the job id and triggers a savepoint.
+	 * @param jobId the job id
+	 * @param savepointDirectory directory the savepoint should be written to
+	 * @return path where the savepoint is located
+	 * @throws Exception In case an error cocurred.
+	 */
+	public String cancelWithSavepoint(JobID jobId, @Nullable String savepointDirectory) throws Exception {
+		final ActorGateway jobManager = getJobManagerGateway();
+
+		Object cancelMsg = new JobManagerMessages.CancelJobWithSavepoint(jobId, savepointDirectory);
+
+		Future<Object> response = jobManager.ask(cancelMsg, timeout);
+		final Object rc = Await.result(response, timeout);
+
+		if (rc instanceof JobManagerMessages.CancellationSuccess) {
+			JobManagerMessages.CancellationSuccess success = (JobManagerMessages.CancellationSuccess) rc;
+			return success.savepointPath();
+		} else if (rc instanceof JobManagerMessages.CancellationFailure) {
+			throw new Exception("Cancel & savepoint for the job with ID " + jobId + " failed.",
+				((JobManagerMessages.CancellationFailure) rc).cause());
+		} else {
+			throw new IllegalStateException("Unexpected response: " + rc);
 		}
 	}
 
@@ -438,7 +696,7 @@ public abstract class ClusterClient {
 	 * Stopping works only for streaming programs. Be aware, that the program might continue to run for
 	 * a while after sending the stop command, because after sources stopped to emit data all operators
 	 * need to finish processing.
-	 * 
+	 *
 	 * @param jobId
 	 *            the job ID of the streaming program to stop
 	 * @throws Exception
@@ -446,26 +704,110 @@ public abstract class ClusterClient {
 	 *             failed. That might be due to an I/O problem, ie, the job-manager is unreachable.
 	 */
 	public void stop(final JobID jobId) throws Exception {
-		final ActorGateway jobManagerGateway = getJobManagerGateway();
+		final ActorGateway jobManager = getJobManagerGateway();
 
-		final Future<Object> response;
-		try {
-			response = jobManagerGateway.ask(new JobManagerMessages.StopJob(jobId), timeout);
-		} catch (final Exception e) {
-			throw new ProgramInvocationException("Failed to query the job manager gateway.", e);
-		}
+		Future<Object> response = jobManager.ask(new JobManagerMessages.StopJob(jobId), timeout);
 
-		final Object result = Await.result(response, timeout);
+		final Object rc = Await.result(response, timeout);
 
-		if (result instanceof JobManagerMessages.StoppingSuccess) {
-			LOG.info("Job stopping with ID " + jobId + " succeeded.");
-		} else if (result instanceof JobManagerMessages.StoppingFailure) {
-			final Throwable t = ((JobManagerMessages.StoppingFailure) result).cause();
-			LOG.info("Job stopping with ID " + jobId + " failed.", t);
-			throw new Exception("Failed to stop the job because of \n" + t.getMessage());
+		if (rc instanceof JobManagerMessages.StoppingSuccess) {
+			// no further action required
+		} else if (rc instanceof JobManagerMessages.StoppingFailure) {
+			throw new Exception("Stopping the job with ID " + jobId + " failed.",
+				((JobManagerMessages.StoppingFailure) rc).cause());
 		} else {
-			throw new Exception("Unknown message received while stopping: " + result.getClass().getName());
+			throw new IllegalStateException("Unexpected response: " + rc);
 		}
+	}
+
+	/**
+	 * Triggers a savepoint for the job identified by the job id. The savepoint will be written to the given savepoint
+	 * directory, or {@link org.apache.flink.configuration.CheckpointingOptions#SAVEPOINT_DIRECTORY} if it is null.
+	 *
+	 * @param jobId job id
+	 * @param savepointDirectory directory the savepoint should be written to
+	 * @return path future where the savepoint is located
+	 * @throws FlinkException if no connection to the cluster could be established
+	 */
+	public CompletableFuture<String> triggerSavepoint(JobID jobId, @Nullable String savepointDirectory) throws FlinkException {
+		final ActorGateway jobManager = getJobManagerGateway();
+
+		Future<Object> response = jobManager.ask(new JobManagerMessages.TriggerSavepoint(jobId, Option.<String>apply(savepointDirectory)),
+			new FiniteDuration(1, TimeUnit.HOURS));
+		CompletableFuture<Object> responseFuture = FutureUtils.<Object>toJava(response);
+
+		return responseFuture.thenApply((responseMessage) -> {
+			if (responseMessage instanceof JobManagerMessages.TriggerSavepointSuccess) {
+				JobManagerMessages.TriggerSavepointSuccess success = (JobManagerMessages.TriggerSavepointSuccess) responseMessage;
+				return success.savepointPath();
+			} else if (responseMessage instanceof JobManagerMessages.TriggerSavepointFailure) {
+				JobManagerMessages.TriggerSavepointFailure failure = (JobManagerMessages.TriggerSavepointFailure) responseMessage;
+				throw new CompletionException(failure.cause());
+			} else {
+				throw new CompletionException(
+					new IllegalStateException("Unknown JobManager response of type " + responseMessage.getClass()));
+			}
+		});
+	}
+
+	public CompletableFuture<Acknowledge> disposeSavepoint(String savepointPath) throws FlinkException {
+		final ActorGateway jobManager = getJobManagerGateway();
+
+		Object msg = new JobManagerMessages.DisposeSavepoint(savepointPath);
+		CompletableFuture<Object> responseFuture = FutureUtils.<Object>toJava(
+			jobManager.ask(
+				msg,
+				timeout));
+
+		return responseFuture.thenApply(
+			(Object response) -> {
+				if (response instanceof JobManagerMessages.DisposeSavepointSuccess$) {
+					return Acknowledge.get();
+				} else if (response instanceof JobManagerMessages.DisposeSavepointFailure) {
+					JobManagerMessages.DisposeSavepointFailure failureResponse = (JobManagerMessages.DisposeSavepointFailure) response;
+
+					if (failureResponse.cause() instanceof ClassNotFoundException) {
+						throw new CompletionException(
+							new ClassNotFoundException("Savepoint disposal failed, because of a " +
+								"missing class. This is most likely caused by a custom state " +
+								"instance, which cannot be disposed without the user code class " +
+								"loader. Please provide the program jar with which you have created " +
+								"the savepoint via -j <JAR> for disposal.",
+								failureResponse.cause().getCause()));
+					} else {
+						throw new CompletionException(failureResponse.cause());
+					}
+				} else {
+					throw new CompletionException(new FlinkRuntimeException("Unknown response type " + response.getClass().getSimpleName() + '.'));
+				}
+			});
+	}
+
+	/**
+	 * Lists the currently running and finished jobs on the cluster.
+	 *
+	 * @return future collection of running and finished jobs
+	 * @throws Exception if no connection to the cluster could be established
+	 */
+	public CompletableFuture<Collection<JobStatusMessage>> listJobs() throws Exception {
+		final ActorGateway jobManager = getJobManagerGateway();
+
+		Future<Object> response = jobManager.ask(new RequestJobDetails(true, false), timeout);
+		CompletableFuture<Object> responseFuture = FutureUtils.<Object>toJava(response);
+
+		return responseFuture.thenApply((responseMessage) -> {
+			if (responseMessage instanceof MultipleJobsDetails) {
+				MultipleJobsDetails details = (MultipleJobsDetails) responseMessage;
+
+				final Collection<JobDetails> jobDetails = details.getJobs();
+				Collection<JobStatusMessage> flattenedDetails = new ArrayList<>(jobDetails.size());
+				jobDetails.forEach(detail -> flattenedDetails.add(new JobStatusMessage(detail.getJobId(), detail.getJobName(), detail.getStatus(), detail.getStartTime())));
+				return flattenedDetails;
+			} else {
+				throw new CompletionException(
+					new IllegalStateException("Unknown JobManager response of type " + responseMessage.getClass()));
+			}
+		});
 	}
 
 	/**
@@ -475,7 +817,7 @@ public abstract class ClusterClient {
 	 * @param jobID The job identifier of a job.
 	 * @return A Map containing the accumulator's name and its value.
 	 */
-	public Map<String, Object> getAccumulators(JobID jobID) throws Exception {
+	public Map<String, OptionalFailure<Object>> getAccumulators(JobID jobID) throws Exception {
 		return getAccumulators(jobID, ClassLoader.getSystemClassLoader());
 	}
 
@@ -486,7 +828,7 @@ public abstract class ClusterClient {
 	 * @param loader The class loader for deserializing the accumulator results.
 	 * @return A Map containing the accumulator's name and its value.
 	 */
-	public Map<String, Object> getAccumulators(JobID jobID, ClassLoader loader) throws Exception {
+	public Map<String, OptionalFailure<Object>> getAccumulators(JobID jobID, ClassLoader loader) throws Exception {
 		ActorGateway jobManagerGateway = getJobManagerGateway();
 
 		Future<Object> response;
@@ -499,7 +841,7 @@ public abstract class ClusterClient {
 		Object result = Await.result(response, timeout);
 
 		if (result instanceof AccumulatorResultsFound) {
-			Map<String, SerializedValue<Object>> serializedAccumulators =
+			Map<String, SerializedValue<OptionalFailure<Object>>> serializedAccumulators =
 					((AccumulatorResultsFound) result).result();
 
 			return AccumulatorHelper.deserializeAccumulators(serializedAccumulators, loader);
@@ -511,14 +853,13 @@ public abstract class ClusterClient {
 		}
 	}
 
-
 	// ------------------------------------------------------------------------
 	//  Sessions
 	// ------------------------------------------------------------------------
 
 	/**
 	 * Tells the JobManager to finish the session (job) defined by the given ID.
-	 * 
+	 *
 	 * @param jobId The ID that identifies the session.
 	 */
 	public void endSession(JobID jobId) throws Exception {
@@ -539,10 +880,10 @@ public abstract class ClusterClient {
 		}
 
 		ActorGateway jobManagerGateway = getJobManagerGateway();
-		
+
 		for (JobID jid : jobIds) {
 			if (jid != null) {
-				LOG.info("Telling job manager to end the session {}.", jid);
+				log.info("Telling job manager to end the session {}.", jid);
 				jobManagerGateway.tell(new JobManagerMessages.RemoveCachedJob(jid));
 			}
 		}
@@ -565,21 +906,17 @@ public abstract class ClusterClient {
 		return getOptimizedPlan(compiler, prog.getPlan(), parallelism);
 	}
 
-	public JobGraph getJobGraph(PackagedProgram prog, FlinkPlan optPlan) throws ProgramInvocationException {
-		return getJobGraph(optPlan, prog.getAllLibraries(), prog.getClasspaths(), null);
+	public static JobGraph getJobGraph(Configuration flinkConfig, PackagedProgram prog, FlinkPlan optPlan, SavepointRestoreSettings savepointSettings) throws ProgramInvocationException {
+		return getJobGraph(flinkConfig, optPlan, prog.getAllLibraries(), prog.getClasspaths(), savepointSettings);
 	}
 
-	public JobGraph getJobGraph(PackagedProgram prog, FlinkPlan optPlan, String savepointPath) throws ProgramInvocationException {
-		return getJobGraph(optPlan, prog.getAllLibraries(), prog.getClasspaths(), savepointPath);
-	}
-
-	private JobGraph getJobGraph(FlinkPlan optPlan, List<URL> jarFiles, List<URL> classpaths, String savepointPath) {
+	public static JobGraph getJobGraph(Configuration flinkConfig, FlinkPlan optPlan, List<URL> jarFiles, List<URL> classpaths, SavepointRestoreSettings savepointSettings) {
 		JobGraph job;
 		if (optPlan instanceof StreamingPlan) {
 			job = ((StreamingPlan) optPlan).getJobGraph();
-			job.setSavepointPath(savepointPath);
+			job.setSavepointRestoreSettings(savepointSettings);
 		} else {
-			JobGraphGenerator gen = new JobGraphGenerator(this.flinkConfig);
+			JobGraphGenerator gen = new JobGraphGenerator(flinkConfig);
 			job = gen.compileJobGraph((OptimizedPlan) optPlan);
 		}
 
@@ -590,7 +927,7 @@ public abstract class ClusterClient {
 				throw new RuntimeException("URL is invalid. This should not happen.", e);
 			}
 		}
- 
+
 		job.setClasspaths(classpaths);
 
 		return job;
@@ -607,13 +944,18 @@ public abstract class ClusterClient {
 	 * @return ActorGateway of the current job manager leader
 	 * @throws Exception
 	 */
-	public ActorGateway getJobManagerGateway() throws Exception {
-		LOG.info("Looking up JobManager");
+	public ActorGateway getJobManagerGateway() throws FlinkException {
+		log.debug("Looking up JobManager");
 
-		return LeaderRetrievalUtils.retrieveLeaderGateway(
-			LeaderRetrievalUtils.createLeaderRetrievalService(flinkConfig),
-			actorSystem,
-			lookupTimeout);
+		try {
+			return LeaderRetrievalUtils.retrieveLeaderGateway(
+				highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),
+				actorSystemLoader.get(),
+				lookupTimeout);
+		} catch (LeaderRetrievalException lre) {
+			throw new FlinkException("Could not connect to the leading JobManager. Please check that the " +
+				"JobManager is running.", lre);
+		}
 	}
 
 	/**
@@ -621,7 +963,7 @@ public abstract class ClusterClient {
 	 * @param message The message to log/print
 	 */
 	protected void logAndSysout(String message) {
-		LOG.info(message);
+		log.info(message);
 		if (printStatusDuringExecution) {
 			System.out.println(message);
 		}
@@ -632,12 +974,20 @@ public abstract class ClusterClient {
 	// ------------------------------------------------------------------------
 
 	/**
-	 * Returns an URL (as a string) to the JobManager web interface
+	 * Blocks until the client has determined that the cluster is ready for Job submission.
+	 *
+	 * <p>This is delayed until right before job submission to report any other errors first
+	 * (e.g. invalid job definitions/errors in the user jar)
+	 */
+	public abstract void waitForClusterToBeReady();
+
+	/**
+	 * Returns an URL (as a string) to the JobManager web interface.
 	 */
 	public abstract String getWebInterfaceURL();
 
 	/**
-	 * Returns the latest cluster status, with number of Taskmanagers and slots
+	 * Returns the latest cluster status, with number of Taskmanagers and slots.
 	 */
 	public abstract GetClusterStatusResponse getClusterStatus();
 
@@ -645,17 +995,14 @@ public abstract class ClusterClient {
 	 * May return new messages from the cluster.
 	 * Messages can be for example about failed containers or container launch requests.
 	 */
-	protected abstract List<String> getNewMessages();
+	public abstract List<String> getNewMessages();
 
 	/**
-	 * Returns a string representation of the cluster.
+	 * Returns the cluster id identifying the cluster to which the client is connected.
+	 *
+	 * @return cluster id of the connected cluster
 	 */
-	protected abstract String getClusterIdentifier();
-
-	/**
-	 * Request the cluster to shut down or disconnect.
-	 */
-	protected abstract void finalizeCluster();
+	public abstract T getClusterId();
 
 	/**
 	 * Set the mode of this client (detached or blocking job execution).
@@ -674,7 +1021,7 @@ public abstract class ClusterClient {
 	}
 
 	/**
-	 * Return the Flink configuration object
+	 * Return the Flink configuration object.
 	 * @return The Flink configuration object
 	 */
 	public Configuration getFlinkConfiguration() {
@@ -682,10 +1029,16 @@ public abstract class ClusterClient {
 	}
 
 	/**
-	 * The client may define an upper limit on the number of slots to use
-	 * @return -1 if unknown
+	 * The client may define an upper limit on the number of slots to use.
+	 * @return <tt>-1</tt> ({@link #MAX_SLOTS_UNKNOWN}) if unknown
 	 */
 	public abstract int getMaxSlots();
+
+	/**
+	 * Returns true if the client already has the user jar and providing it again would
+	 * result in duplicate uploading of the jar.
+	 */
+	public abstract boolean hasUserJarsInClassPath(List<URL> userJarFiles);
 
 	/**
 	 * Calls the subclasses' submitJob method. It may decide to simply call one of the run methods or it may perform
@@ -693,7 +1046,21 @@ public abstract class ClusterClient {
 	 * @param jobGraph The JobGraph to be submitted
 	 * @return JobSubmissionResult
 	 */
-	protected abstract JobSubmissionResult submitJob(JobGraph jobGraph, ClassLoader classLoader)
+	public abstract JobSubmissionResult submitJob(JobGraph jobGraph, ClassLoader classLoader)
 		throws ProgramInvocationException;
 
+	/**
+	 * Rescales the specified job such that it will have the new parallelism.
+	 *
+	 * @param jobId specifying the job to modify
+	 * @param newParallelism specifying the new parallelism of the rescaled job
+	 * @return Future which is completed once the rescaling has been completed
+	 */
+	public CompletableFuture<Acknowledge> rescaleJob(JobID jobId, int newParallelism) {
+		throw new UnsupportedOperationException("The " + getClass().getSimpleName() + " does not support rescaling.");
+	}
+
+	public void shutDownCluster() {
+		throw new UnsupportedOperationException("The " + getClass().getSimpleName() + " does not support shutDownCluster.");
+	}
 }

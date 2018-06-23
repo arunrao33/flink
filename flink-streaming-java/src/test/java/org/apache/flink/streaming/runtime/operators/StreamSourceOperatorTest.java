@@ -23,52 +23,60 @@ import org.apache.flink.api.common.accumulators.Accumulator;
 import org.apache.flink.api.common.functions.StoppableFunction;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.execution.Environment;
+import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.operators.testutils.DummyEnvironment;
+import org.apache.flink.runtime.state.memory.MemoryStateBackend;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.api.operators.StoppableStreamSource;
 import org.apache.flink.streaming.api.operators.StreamSource;
+import org.apache.flink.streaming.api.operators.StreamSourceContexts;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamElement;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.streamstatus.StreamStatus;
+import org.apache.flink.streaming.runtime.streamstatus.StreamStatusMaintainer;
+import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
+import org.apache.flink.streaming.runtime.tasks.TestProcessingTimeService;
+import org.apache.flink.streaming.util.CollectorOutput;
 
-import org.apache.flink.streaming.runtime.tasks.TestTimeServiceProvider;
-import org.apache.flink.streaming.runtime.tasks.TimeServiceProvider;
+import org.junit.Assert;
 import org.junit.Test;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.ScheduledFuture;
 
-import static org.junit.Assert.*;
-
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyLong;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+/**
+ * Tests for {@link StreamSource} operators.
+ */
 @SuppressWarnings("serial")
 public class StreamSourceOperatorTest {
-	
+
 	@Test
 	public void testEmitMaxWatermarkForFiniteSource() throws Exception {
 
 		// regular stream source operator
-		StreamSource<String, FiniteSource<String>> operator = 
+		StreamSource<String, FiniteSource<String>> operator =
 				new StreamSource<>(new FiniteSource<String>());
-		
+
 		final List<StreamElement> output = new ArrayList<>();
-		
-		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, null);
-		operator.run(new Object(), new CollectorOutput<String>(output));
-		
+
+		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, 0);
+		operator.run(new Object(), mock(StreamStatusMaintainer.class), new CollectorOutput<String>(output));
+
 		assertEquals(1, output.size());
 		assertEquals(Watermark.MAX_WATERMARK, output.get(0));
 	}
@@ -82,29 +90,27 @@ public class StreamSourceOperatorTest {
 		final StreamSource<String, InfiniteSource<String>> operator =
 				new StreamSource<>(new InfiniteSource<String>());
 
-
-		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, null);
+		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, 0);
 		operator.cancel();
 
 		// run and exit
-		operator.run(new Object(), new CollectorOutput<String>(output));
-		
+		operator.run(new Object(), mock(StreamStatusMaintainer.class), new CollectorOutput<String>(output));
+
 		assertTrue(output.isEmpty());
 	}
-	
+
 	@Test
 	public void testNoMaxWatermarkOnAsyncCancel() throws Exception {
 
 		final List<StreamElement> output = new ArrayList<>();
 		final Thread runner = Thread.currentThread();
-		
+
 		// regular stream source operator
 		final StreamSource<String, InfiniteSource<String>> operator =
 				new StreamSource<>(new InfiniteSource<String>());
 
-		
-		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, null);
-		
+		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, 0);
+
 		// trigger an async cancel in a bit
 		new Thread("canceler") {
 			@Override
@@ -116,10 +122,10 @@ public class StreamSourceOperatorTest {
 				runner.interrupt();
 			}
 		}.start();
-		
+
 		// run and wait to be canceled
 		try {
-			operator.run(new Object(), new CollectorOutput<String>(output));
+			operator.run(new Object(), mock(StreamStatusMaintainer.class), new CollectorOutput<String>(output));
 		}
 		catch (InterruptedException ignored) {}
 
@@ -135,12 +141,11 @@ public class StreamSourceOperatorTest {
 		final StoppableStreamSource<String, InfiniteSource<String>> operator =
 				new StoppableStreamSource<>(new InfiniteSource<String>());
 
-
-		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, null);
+		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, 0);
 		operator.stop();
 
 		// run and stop
-		operator.run(new Object(), new CollectorOutput<String>(output));
+		operator.run(new Object(), mock(StreamStatusMaintainer.class), new CollectorOutput<String>(output));
 
 		assertTrue(output.isEmpty());
 	}
@@ -154,8 +159,7 @@ public class StreamSourceOperatorTest {
 		final StoppableStreamSource<String, InfiniteSource<String>> operator =
 				new StoppableStreamSource<>(new InfiniteSource<String>());
 
-
-		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, null);
+		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, 0);
 
 		// trigger an async cancel in a bit
 		new Thread("canceler") {
@@ -169,11 +173,58 @@ public class StreamSourceOperatorTest {
 		}.start();
 
 		// run and wait to be stopped
-		operator.run(new Object(), new CollectorOutput<String>(output));
+		operator.run(new Object(), mock(StreamStatusMaintainer.class), new CollectorOutput<String>(output));
 
 		assertTrue(output.isEmpty());
 	}
-	
+
+	/**
+	 * Test that latency marks are emitted.
+	 */
+	@Test
+	public void testLatencyMarkEmission() throws Exception {
+		final List<StreamElement> output = new ArrayList<>();
+
+		final long maxProcessingTime = 100L;
+		final long latencyMarkInterval = 10L;
+
+		final TestProcessingTimeService testProcessingTimeService = new TestProcessingTimeService();
+		testProcessingTimeService.setCurrentTime(0L);
+		final List<Long> processingTimes = Arrays.asList(1L, 10L, 11L, 21L, maxProcessingTime);
+
+		// regular stream source operator
+		final StreamSource<Long, ProcessingTimeServiceSource> operator =
+				new StreamSource<>(new ProcessingTimeServiceSource(testProcessingTimeService, processingTimes));
+
+		// emit latency marks every 10 milliseconds.
+		setupSourceOperator(operator, TimeCharacteristic.EventTime, 0, latencyMarkInterval, testProcessingTimeService);
+
+		// run and wait to be stopped
+		operator.run(new Object(), mock(StreamStatusMaintainer.class), new CollectorOutput<Long>(output));
+
+		int numberLatencyMarkers = (int) (maxProcessingTime / latencyMarkInterval) + 1;
+
+		assertEquals(
+			numberLatencyMarkers + 1, // + 1 is the final watermark element
+			output.size());
+
+		long timestamp = 0L;
+
+		int i = 0;
+		// and that its only latency markers + a final watermark
+		for (; i < output.size() - 1; i++) {
+			StreamElement se = output.get(i);
+			Assert.assertTrue(se.isLatencyMarker());
+			Assert.assertEquals(operator.getOperatorID(), se.asLatencyMarker().getOperatorId());
+			Assert.assertEquals(0, se.asLatencyMarker().getSubtaskIndex());
+			Assert.assertTrue(se.asLatencyMarker().getMarkedTime() == timestamp);
+
+			timestamp += latencyMarkInterval;
+		}
+
+		Assert.assertTrue(output.get(i).isWatermark());
+	}
+
 	@Test
 	public void testAutomaticWatermarkContext() throws Exception {
 
@@ -182,24 +233,27 @@ public class StreamSourceOperatorTest {
 			new StoppableStreamSource<>(new InfiniteSource<String>());
 
 		long watermarkInterval = 10;
-		TestTimeServiceProvider timeProvider = new TestTimeServiceProvider();
-		setupSourceOperator(operator, TimeCharacteristic.IngestionTime, watermarkInterval, timeProvider);
+		TestProcessingTimeService processingTimeService = new TestProcessingTimeService();
+		processingTimeService.setCurrentTime(0);
+
+		setupSourceOperator(operator, TimeCharacteristic.IngestionTime, watermarkInterval, 0, processingTimeService);
 
 		final List<StreamElement> output = new ArrayList<>();
 
-		StreamSource.AutomaticWatermarkContext<String> ctx =
-			new StreamSource.AutomaticWatermarkContext<>(
-				operator,
-				operator.getContainingTask().getCheckpointLock(),
-				new CollectorOutput<String>(output),
-				operator.getExecutionConfig().getAutoWatermarkInterval());
+		StreamSourceContexts.getSourceContext(TimeCharacteristic.IngestionTime,
+			operator.getContainingTask().getProcessingTimeService(),
+			operator.getContainingTask().getCheckpointLock(),
+			operator.getContainingTask().getStreamStatusMaintainer(),
+			new CollectorOutput<String>(output),
+			operator.getExecutionConfig().getAutoWatermarkInterval(),
+			-1);
 
 		// periodically emit the watermarks
 		// even though we start from 1 the watermark are still
 		// going to be aligned with the watermark interval.
 
 		for (long i = 1; i < 100; i += watermarkInterval)  {
-			timeProvider.setCurrentTime(i);
+			processingTimeService.setCurrentTime(i);
 		}
 
 		assertTrue(output.size() == 9);
@@ -213,21 +267,36 @@ public class StreamSourceOperatorTest {
 	}
 
 	// ------------------------------------------------------------------------
-	
+
+	@SuppressWarnings("unchecked")
+	private static <T> void setupSourceOperator(StreamSource<T, ?> operator,
+			TimeCharacteristic timeChar,
+			long watermarkInterval,
+			long latencyMarkInterval) {
+		setupSourceOperator(operator, timeChar, watermarkInterval, latencyMarkInterval, new TestProcessingTimeService());
+	}
+
 	@SuppressWarnings("unchecked")
 	private static <T> void setupSourceOperator(StreamSource<T, ?> operator,
 												TimeCharacteristic timeChar,
 												long watermarkInterval,
-												final TimeServiceProvider timeProvider) {
+												long latencyMarkInterval,
+												final ProcessingTimeService timeProvider) {
 
 		ExecutionConfig executionConfig = new ExecutionConfig();
 		executionConfig.setAutoWatermarkInterval(watermarkInterval);
+		executionConfig.setLatencyTrackingInterval(latencyMarkInterval);
 
 		StreamConfig cfg = new StreamConfig(new Configuration());
-		
+		cfg.setStateBackend(new MemoryStateBackend());
+
 		cfg.setTimeCharacteristic(timeChar);
+		cfg.setOperatorID(new OperatorID());
 
 		Environment env = new DummyEnvironment("MockTwoInputTask", 1, 0);
+
+		StreamStatusMaintainer streamStatusMaintainer = mock(StreamStatusMaintainer.class);
+		when(streamStatusMaintainer.getStreamStatus()).thenReturn(StreamStatus.ACTIVE);
 
 		StreamTask<?, ?> mockTask = mock(StreamTask.class);
 		when(mockTask.getName()).thenReturn("Mock Task");
@@ -236,47 +305,23 @@ public class StreamSourceOperatorTest {
 		when(mockTask.getEnvironment()).thenReturn(env);
 		when(mockTask.getExecutionConfig()).thenReturn(executionConfig);
 		when(mockTask.getAccumulatorMap()).thenReturn(Collections.<String, Accumulator<?, ?>>emptyMap());
+		when(mockTask.getStreamStatusMaintainer()).thenReturn(streamStatusMaintainer);
 
-		doAnswer(new Answer<ScheduledFuture>() {
+		doAnswer(new Answer<ProcessingTimeService>() {
 			@Override
-			public ScheduledFuture answer(InvocationOnMock invocation) throws Throwable {
-				final long execTime = (Long) invocation.getArguments()[0];
-				final Triggerable target = (Triggerable) invocation.getArguments()[1];
-
+			public ProcessingTimeService answer(InvocationOnMock invocation) throws Throwable {
 				if (timeProvider == null) {
-					throw new RuntimeException("The time provider is null");
+					throw new RuntimeException("The time provider is null.");
 				}
-
-				timeProvider.registerTimer(execTime, new Runnable() {
-
-					@Override
-					public void run() {
-						try {
-							target.trigger(execTime);
-						} catch (Exception e) {
-							e.printStackTrace();
-						}
-					}
-				});
-				return null;
+				return timeProvider;
 			}
-		}).when(mockTask).registerTimer(anyLong(), any(Triggerable.class));
-
-		doAnswer(new Answer<Long>() {
-			@Override
-			public Long answer(InvocationOnMock invocation) throws Throwable {
-				if (timeProvider == null) {
-					throw new RuntimeException("The time provider is null");
-				}
-				return timeProvider.getCurrentProcessingTime();
-			}
-		}).when(mockTask).getCurrentProcessingTime();
+		}).when(mockTask).getProcessingTimeService();
 
 		operator.setup(mockTask, cfg, (Output<StreamRecord<T>>) mock(Output.class));
 	}
 
 	// ------------------------------------------------------------------------
-	
+
 	private static final class FiniteSource<T> implements SourceFunction<T>, StoppableFunction {
 
 		@Override
@@ -292,7 +337,7 @@ public class StreamSourceOperatorTest {
 	private static final class InfiniteSource<T> implements SourceFunction<T>, StoppableFunction {
 
 		private volatile boolean running = true;
-		
+
 		@Override
 		public void run(SourceContext<T> ctx) throws Exception {
 			while (running) {
@@ -311,27 +356,32 @@ public class StreamSourceOperatorTest {
 		}
 	}
 
-	// ------------------------------------------------------------------------
-	
-	private static class CollectorOutput<T> implements Output<StreamRecord<T>> {
+	private static final class ProcessingTimeServiceSource implements SourceFunction<Long> {
 
-		private final List<StreamElement> list;
+		private final TestProcessingTimeService processingTimeService;
+		private final List<Long> processingTimes;
 
-		private CollectorOutput(List<StreamElement> list) {
-			this.list = list;
+		private boolean cancelled = false;
+
+		private ProcessingTimeServiceSource(TestProcessingTimeService processingTimeService, List<Long> processingTimes) {
+			this.processingTimeService = processingTimeService;
+			this.processingTimes = processingTimes;
 		}
 
 		@Override
-		public void emitWatermark(Watermark mark) {
-			list.add(mark);
+		public void run(SourceContext<Long> ctx) throws Exception {
+			for (Long processingTime : processingTimes) {
+				if (cancelled) {
+					break;
+				}
+
+				processingTimeService.setCurrentTime(processingTime);
+			}
 		}
 
 		@Override
-		public void collect(StreamRecord<T> record) {
-			list.add(record);
+		public void cancel() {
+			cancelled = true;
 		}
-
-		@Override
-		public void close() {}
 	}
 }

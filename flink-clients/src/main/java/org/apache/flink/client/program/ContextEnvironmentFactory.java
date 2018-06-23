@@ -21,6 +21,7 @@ package org.apache.flink.client.program;
 import org.apache.flink.api.common.InvalidProgramException;
 import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.ExecutionEnvironmentFactory;
+import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
 
 import java.net.URL;
 import java.util.List;
@@ -32,7 +33,7 @@ import java.util.List;
  */
 public class ContextEnvironmentFactory implements ExecutionEnvironmentFactory {
 
-	private final ClusterClient client;
+	private final ClusterClient<?> client;
 
 	private final List<URL> jarFilesToAttach;
 
@@ -46,30 +47,29 @@ public class ContextEnvironmentFactory implements ExecutionEnvironmentFactory {
 
 	private ExecutionEnvironment lastEnvCreated;
 
-	private String savepointPath;
+	private SavepointRestoreSettings savepointSettings;
 
-	public ContextEnvironmentFactory(ClusterClient client, List<URL> jarFilesToAttach,
+	public ContextEnvironmentFactory(ClusterClient<?> client, List<URL> jarFilesToAttach,
 			List<URL> classpathsToAttach, ClassLoader userCodeClassLoader, int defaultParallelism,
-			boolean isDetached, String savepointPath)
-	{
+			boolean isDetached, SavepointRestoreSettings savepointSettings) {
 		this.client = client;
 		this.jarFilesToAttach = jarFilesToAttach;
 		this.classpathsToAttach = classpathsToAttach;
 		this.userCodeClassLoader = userCodeClassLoader;
 		this.defaultParallelism = defaultParallelism;
 		this.isDetached = isDetached;
-		this.savepointPath = savepointPath;
+		this.savepointSettings = savepointSettings;
 	}
 
 	@Override
 	public ExecutionEnvironment createExecutionEnvironment() {
 		if (isDetached && lastEnvCreated != null) {
-			throw new InvalidProgramException("Multiple enviornments cannot be created in detached mode");
+			throw new InvalidProgramException("Multiple environments cannot be created in detached mode");
 		}
 
-		lastEnvCreated = isDetached ?
-				new DetachedEnvironment(client, jarFilesToAttach, classpathsToAttach, userCodeClassLoader, savepointPath):
-				new ContextEnvironment(client, jarFilesToAttach, classpathsToAttach, userCodeClassLoader, savepointPath);
+		lastEnvCreated = isDetached
+			? new DetachedEnvironment(client, jarFilesToAttach, classpathsToAttach, userCodeClassLoader, savepointSettings)
+			: new ContextEnvironment(client, jarFilesToAttach, classpathsToAttach, userCodeClassLoader, savepointSettings);
 		if (defaultParallelism > 0) {
 			lastEnvCreated.setParallelism(defaultParallelism);
 		}

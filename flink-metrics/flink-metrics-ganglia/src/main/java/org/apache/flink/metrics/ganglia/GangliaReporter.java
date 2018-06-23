@@ -18,27 +18,30 @@
 
 package org.apache.flink.metrics.ganglia;
 
-import com.codahale.metrics.ScheduledReporter;
-
-import info.ganglia.gmetric4j.gmetric.GMetric;
-
 import org.apache.flink.annotation.PublicEvolving;
-import org.apache.flink.configuration.Configuration;
 import org.apache.flink.dropwizard.ScheduledDropwizardReporter;
+import org.apache.flink.metrics.MetricConfig;
+
+import com.codahale.metrics.ScheduledReporter;
+import info.ganglia.gmetric4j.gmetric.GMetric;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * This class acts as a factory for the {@link com.codahale.metrics.ganglia.GangliaReporter} and allows using it as a
+ * Flink reporter.
+ */
 @PublicEvolving
 public class GangliaReporter extends ScheduledDropwizardReporter {
-	
+
 	public static final String ARG_DMAX = "dmax";
 	public static final String ARG_TMAX = "tmax";
 	public static final String ARG_TTL = "ttl";
 	public static final String ARG_MODE_ADDRESSING = "addressingMode";
 
 	@Override
-	public ScheduledReporter getReporter(Configuration config) {
+	public ScheduledReporter getReporter(MetricConfig config) {
 
 		try {
 			String host = config.getString(ARG_HOST, null);
@@ -47,7 +50,7 @@ public class GangliaReporter extends ScheduledDropwizardReporter {
 				throw new IllegalArgumentException("Invalid host/port configuration. Host: " + host + " Port: " + port);
 			}
 			String addressingMode = config.getString(ARG_MODE_ADDRESSING, "MULTICAST");
-			int ttl = config.getInteger(ARG_TTL, -1);
+			int ttl = config.getInteger(ARG_TTL, 1);
 			GMetric gMetric = new GMetric(host, port, GMetric.UDPAddressingMode.valueOf(addressingMode), ttl);
 
 			String prefix = config.getString(ARG_PREFIX, null);
@@ -71,6 +74,8 @@ public class GangliaReporter extends ScheduledDropwizardReporter {
 			builder.withDMax(dMax);
 			builder.withTMax(tMax);
 
+			log.info("Configured GangliaReporter with {host:{}, port:{}, dmax:{}, tmax:{}, ttl:{}, addressingMode:{}}",
+				host, port, dMax, tMax, ttl, addressingMode);
 			return builder.build(gMetric);
 		} catch (IOException e) {
 			throw new RuntimeException("Error while instantiating GangliaReporter.", e);

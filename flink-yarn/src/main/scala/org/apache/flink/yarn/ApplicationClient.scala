@@ -25,11 +25,11 @@ import grizzled.slf4j.Logger
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.runtime.clusterframework.messages._
 import org.apache.flink.runtime.leaderretrieval.{LeaderRetrievalListener, LeaderRetrievalService}
-import org.apache.flink.runtime.{LeaderSessionMessageFilter, FlinkActor, LogMessages}
+import org.apache.flink.runtime.{FlinkActor, LeaderSessionMessageFilter, LogMessages}
 import org.apache.flink.yarn.YarnMessages._
+
 import scala.collection.mutable
 import scala.concurrent.duration._
-
 import scala.language.postfixOps
 
 /** Actor which is responsible to repeatedly poll the Yarn cluster status from the ResourceManager.
@@ -48,7 +48,6 @@ class ApplicationClient(
   with LeaderSessionMessageFilter
   with LogMessages
   with LeaderRetrievalListener{
-  import context._
 
   val log = Logger(getClass)
 
@@ -60,7 +59,6 @@ class ApplicationClient(
   var pollingTimer: Option[Cancellable] = None
   var running = false
   var messagesQueue : mutable.Queue[InfoMessage] = mutable.Queue[InfoMessage]()
-  var latestClusterStatus : Option[GetClusterStatusResponse] = None
   var stopMessageReceiver : Option[ActorRef] = None
 
   var leaderSessionID: Option[UUID] = None
@@ -133,21 +131,10 @@ class ApplicationClient(
       }
 
     case msg: RegisterInfoMessageListenerSuccessful =>
-      // The job manager acts as a proxy between the client and the resource managert
+      // The job manager acts as a proxy between the client and the resource manager
       val jm = sender()
       log.info(s"Successfully registered at the ResourceManager using JobManager $jm")
-
       yarnJobManager = Some(jm)
-
-      // schedule a periodic status report from the JobManager
-      // request the number of task managers and slots from the job manager
-      pollingTimer = Some(
-        context.system.scheduler.schedule(
-          INITIAL_POLLING_DELAY,
-          WAIT_FOR_YARN_INTERVAL,
-          yarnJobManager.get,
-          decorateMessage(GetClusterStatus.getInstance()))
-      )
 
     case JobManagerLeaderAddress(jobManagerAkkaURL, newLeaderSessionID) =>
       log.info(s"Received address of new leader $jobManagerAkkaURL with session ID" +
@@ -192,20 +179,6 @@ class ApplicationClient(
           }(context.dispatcher)
       }
 
-    // handle the responses from the PollYarnClusterStatus messages to the yarn job mgr
-    case status: GetClusterStatusResponse =>
-      latestClusterStatus = Some(status)
-
-    // locally get cluster status
-    case LocalGetYarnClusterStatus =>
-      sender() ! decorateMessage(latestClusterStatus)
-
-    // Forward message to Application Master
-    case LocalStopAMAfterJob(jobID) =>
-      yarnJobManager foreach {
-        _ forward decorateMessage(new ShutdownClusterAfterJob(jobID))
-      }
-
     // -----------------  handle messages from the cluster -------------------
     // receive remote messages
     case msg: InfoMessage =>
@@ -214,7 +187,7 @@ class ApplicationClient(
 
     // locally forward messages
     case LocalGetYarnMessage =>
-      if(messagesQueue.nonEmpty) {
+      if (messagesQueue.nonEmpty) {
         sender() ! decorateMessage(Option(messagesQueue.dequeue()))
       } else {
         sender() ! decorateMessage(None)

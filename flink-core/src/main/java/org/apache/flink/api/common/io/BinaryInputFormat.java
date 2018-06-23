@@ -19,6 +19,7 @@
 package org.apache.flink.api.common.io;
 
 import org.apache.flink.annotation.Public;
+import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.api.common.io.statistics.BaseStatistics;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
@@ -85,25 +86,38 @@ public abstract class BinaryInputFormat<T> extends FileInputFormat<T>
 	public void configure(Configuration parameters) {
 		super.configure(parameters);
 
-		// read own parameters
-		this.blockSize = parameters.getLong(BLOCK_SIZE_PARAMETER_KEY, NATIVE_BLOCK_SIZE);
-		if (this.blockSize < 1 && this.blockSize != NATIVE_BLOCK_SIZE) {
+		// the if is to prevent the configure() method from
+		// overwriting the value set by the setter
+
+		if (this.blockSize == NATIVE_BLOCK_SIZE) {
+			long blockSize = parameters.getLong(BLOCK_SIZE_PARAMETER_KEY, NATIVE_BLOCK_SIZE);
+			setBlockSize(blockSize);
+		}
+	}
+
+	public void setBlockSize(long blockSize) {
+		if (blockSize < 1 && blockSize != NATIVE_BLOCK_SIZE) {
 			throw new IllegalArgumentException("The block size parameter must be set and larger than 0.");
 		}
-		if (this.blockSize > Integer.MAX_VALUE) {
-			throw new UnsupportedOperationException("Currently only block size up to Integer.MAX_VALUE are supported");
+		if (blockSize > Integer.MAX_VALUE) {
+			throw new UnsupportedOperationException("Currently only block sizes up to Integer.MAX_VALUE are supported");
 		}
+		this.blockSize = blockSize;
+	}
+
+	public long getBlockSize() {
+		return this.blockSize;
 	}
 
 	@Override
 	public FileInputSplit[] createInputSplits(int minNumSplits) throws IOException {
-		List<FileStatus> files = this.getFiles();
-
-		final FileSystem fs = this.filePath.getFileSystem();
-		final long blockSize = this.blockSize == NATIVE_BLOCK_SIZE ? fs.getDefaultBlockSize() : this.blockSize;
+		final List<FileStatus> files = this.getFiles();
 
 		final List<FileInputSplit> inputSplits = new ArrayList<FileInputSplit>(minNumSplits);
 		for (FileStatus file : files) {
+			final FileSystem fs = file.getPath().getFileSystem();
+			final long blockSize = this.blockSize == NATIVE_BLOCK_SIZE ? fs.getDefaultBlockSize() : this.blockSize;
+
 			for (long pos = 0, length = file.getLen(); pos < length; pos += blockSize) {
 				long remainingLength = Math.min(pos + blockSize, length) - pos;
 
@@ -118,10 +132,10 @@ public abstract class BinaryInputFormat<T> extends FileInputFormat<T>
 
 		if (inputSplits.size() < minNumSplits) {
 			LOG.warn(String.format(
-				"With the given block size %d, the file %s cannot be split into %d blocks. Filling up with empty splits...",
-				blockSize, this.filePath, minNumSplits));
+				"With the given block size %d, the files %s cannot be split into %d blocks. Filling up with empty splits...",
+				blockSize, Arrays.toString(getFilePaths()), minNumSplits));
 			FileStatus last = files.get(files.size() - 1);
-			final BlockLocation[] blocks = fs.getFileBlockLocations(last, 0, last.getLen());
+			final BlockLocation[] blocks = last.getPath().getFileSystem().getFileBlockLocations(last, 0, last.getLen());
 			for (int index = files.size(); index < minNumSplits; index++) {
 				inputSplits.add(new FileInputSplit(index, last.getPath(), last.getLen(), 0, blocks[0].getHosts()));
 			}
@@ -132,45 +146,39 @@ public abstract class BinaryInputFormat<T> extends FileInputFormat<T>
 
 	protected List<FileStatus> getFiles() throws IOException {
 		// get all the files that are involved in the splits
-		List<FileStatus> files = new ArrayList<FileStatus>();
+		List<FileStatus> files = new ArrayList<>();
 
-		final FileSystem fs = this.filePath.getFileSystem();
-		final FileStatus pathFile = fs.getFileStatus(this.filePath);
+		for (Path filePath: getFilePaths()) {
+			final FileSystem fs = filePath.getFileSystem();
+			final FileStatus pathFile = fs.getFileStatus(filePath);
 
-		if (pathFile.isDir()) {
-			// input is directory. list all contained files
-			final FileStatus[] partials = fs.listStatus(this.filePath);
-			for (FileStatus partial : partials) {
-				if (!partial.isDir()) {
-					files.add(partial);
+			if (pathFile.isDir()) {
+				// input is directory. list all contained files
+				final FileStatus[] partials = fs.listStatus(filePath);
+				for (FileStatus partial : partials) {
+					if (!partial.isDir()) {
+						files.add(partial);
+					}
 				}
+			} else {
+				files.add(pathFile);
 			}
-		} else {
-			files.add(pathFile);
 		}
-
 		return files;
 	}
 
 	@Override
 	public SequentialStatistics getStatistics(BaseStatistics cachedStats) {
 
-		final FileBaseStatistics cachedFileStats = (cachedStats != null && cachedStats instanceof FileBaseStatistics) ?
+		final FileBaseStatistics cachedFileStats = cachedStats instanceof FileBaseStatistics ?
 			(FileBaseStatistics) cachedStats : null;
 
 		try {
-			final Path filePath = this.filePath;
-
-			// get the filesystem
-			final FileSystem fs = FileSystem.get(filePath.toUri());
 			final ArrayList<FileStatus> allFiles = new ArrayList<FileStatus>(1);
-
-			// let the file input format deal with the up-to-date check and the basic size
-			final FileBaseStatistics stats = getFileStats(cachedFileStats, filePath, fs, allFiles);
+			final FileBaseStatistics stats = getFileStats(cachedFileStats, getFilePaths(), allFiles);
 			if (stats == null) {
 				return null;
 			}
-
 			// check whether the file stats are still sequential stats (in that case they are still valid)
 			if (stats instanceof SequentialStatistics) {
 				return (SequentialStatistics) stats;
@@ -179,15 +187,15 @@ public abstract class BinaryInputFormat<T> extends FileInputFormat<T>
 		} catch (IOException ioex) {
 			if (LOG.isWarnEnabled()) {
 				LOG.warn(
-					String.format("Could not determine complete statistics for file '%s' due to an I/O error",
-						this.filePath),
+					String.format("Could not determine complete statistics for files '%s' due to an I/O error",
+						Arrays.toString(getFilePaths())),
 					ioex);
 			}
 		} catch (Throwable t) {
 			if (LOG.isErrorEnabled()) {
 				LOG.error(
-					String.format("Unexpected problem while getting the file statistics for file '%s'",
-						this.filePath),
+					String.format("Unexpected problem while getting the file statistics for files '%s'",
+						Arrays.toString(getFilePaths())),
 					t);
 			}
 		}
@@ -373,6 +381,7 @@ public abstract class BinaryInputFormat<T> extends FileInputFormat<T>
 	//  Checkpointing
 	// --------------------------------------------------------------------------------------------
 
+	@PublicEvolving
 	@Override
 	public Tuple2<Long, Long> getCurrentState() throws IOException {
 		if (this.blockBasedInput == null) {
@@ -385,6 +394,7 @@ public abstract class BinaryInputFormat<T> extends FileInputFormat<T>
 		);
 	}
 
+	@PublicEvolving
 	@Override
 	public void reopen(FileInputSplit split, Tuple2<Long, Long> state) throws IOException {
 		Preconditions.checkNotNull(split, "reopen() cannot be called on a null split.");
